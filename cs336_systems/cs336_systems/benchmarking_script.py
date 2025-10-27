@@ -2,6 +2,7 @@ from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 
 import numpy as np
 import pandas as pd
@@ -55,13 +56,16 @@ def run_and_benchmark(warmup: int, steps: int):
         optimizer.zero_grad(set_to_none=True)
 
         # ---- Forward ----
+        nvtx.range_push("benchmark_step_fwrd_1")
         torch.cuda.synchronize()
         start_fwd = timer()
         logits = model(x)
         torch.cuda.synchronize()
         end_fwd = timer()
+        nvtx.range_pop()
 
         # ---- Backward ----
+        nvtx.range_push("benchmark_step_bwrd_1")
         loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
         torch.cuda.synchronize()
         start_bwd = timer()
@@ -69,6 +73,7 @@ def run_and_benchmark(warmup: int, steps: int):
         optimizer.step()
         torch.cuda.synchronize()
         end_bwd = timer()
+        nvtx.range_pop()
 
         times_fwd.append(end_fwd - start_fwd)
         times_bwd.append(end_bwd - start_bwd)
