@@ -237,6 +237,7 @@ def flash_fwd_kernel_gpt(
     N_QUERIES,
     N_KEYS,
     scale,
+    IS_CAUSAL: tl.constexpr,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
@@ -323,6 +324,13 @@ def flash_fwd_kernel_gpt(
         # compute scores: (BQ, D) @ (D, BK) -> (BQ, BK)
         S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
 
+        # apply causal mask if needed: query at row i can only attend to key at col j if j <= i
+        if IS_CAUSAL:
+            # row_idx: absolute query positions, col_idx: absolute key positions
+            # mask out positions where col_idx > row_idx (i.e., future keys)
+            causal_mask = row_idx[:, None] >= col_idx[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+            S_ij = tl.where(causal_mask, S_ij, S_ij - 1e6)
+
         # row-wise max
         row_max = tl.max(S_ij, axis=1)  # (Q_TILE_SIZE,)
         m_i_j = tl.maximum(m_i_prev, row_max)  # (Q_TILE_SIZE,)
@@ -363,128 +371,6 @@ def flash_fwd_kernel_gpt(
 
     # store with masks (cast back to output dtype later in wrapper if needed)
     # row_mask: (BQ,) -> used as mask for store; for O (BQ, D) use row_mask[:, None]
-    tl.store(O_block_ptr, tl.cast(O_final, tl.float32))
-    tl.store(L_block_ptr, tl.cast(L_final, tl.float32))
-
-
-@triton.jit
-def flash_fwd_kernel_safe(
-    Q_ptr,  # [B, Nq, D]
-    K_ptr,  # [B, Nk, D]
-    V_ptr,  # [B, Nk, D]
-    O_ptr,  # [B, Nq, D]
-    L_ptr,  # [B, Nq]
-    stride_qb,
-    stride_qq,
-    stride_qd,
-    stride_kb,
-    stride_kk,
-    stride_kd,
-    stride_vb,
-    stride_vk,
-    stride_vd,
-    stride_ob,
-    stride_oq,
-    stride_od,
-    stride_lb,
-    stride_lq,
-    N_QUERIES,
-    N_KEYS,
-    scale,
-    D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,
-):
-    batch_idx = tl.program_id(1)
-    q_tile_idx = tl.program_id(0)
-
-    # load Q tile
-    Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_idx * stride_qb,
-        shape=(N_QUERIES, D),
-        strides=(stride_qq, stride_qd),
-        offsets=(q_tile_idx * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-    Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1))
-    Q_i = tl.cast(Q_i, tl.float32)
-
-    # init output accumulators
-    O_i_prev = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    m_i_prev = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
-    l_i_prev = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-
-    for k_tile_idx in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-        # load K/V tile
-        K_block_ptr = tl.make_block_ptr(
-            K_ptr + batch_idx * stride_kb,
-            shape=(N_KEYS, D),
-            strides=(stride_kk, stride_kd),
-            offsets=(k_tile_idx * K_TILE_SIZE, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0),
-        )
-        V_block_ptr = tl.make_block_ptr(
-            V_ptr + batch_idx * stride_vb,
-            shape=(N_KEYS, D),
-            strides=(stride_vk, stride_vd),
-            offsets=(k_tile_idx * K_TILE_SIZE, 0),
-            block_shape=(K_TILE_SIZE, D),
-            order=(1, 0),
-        )
-
-        # boundary check last key tile
-        K_j = tl.load(K_block_ptr, boundary_check=(0, 1))
-        V_j = tl.load(V_block_ptr, boundary_check=(0, 1))
-        K_j = tl.cast(K_j, tl.float32)
-        V_j = tl.cast(V_j, tl.float32)
-
-        # mask for last key tile (ignore padded keys)
-        key_mask = tl.arange(0, K_TILE_SIZE) + k_tile_idx * K_TILE_SIZE < N_KEYS
-        key_mask = tl.cast(key_mask, tl.float32)  # 1.0 for valid, 0.0 for invalid
-
-        # attention scores
-        S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # (BQ, BK)
-        S_ij = S_ij * key_mask[None, :] + (-1e9) * (1.0 - key_mask[None, :])  # mask invalid keys
-
-        # numerically stable softmax accumulation
-        m_i_j = tl.maximum(m_i_prev, tl.max(S_ij, axis=1))
-        P_tmp = tl.exp(S_ij - tl.reshape(m_i_j, (Q_TILE_SIZE, 1)))
-        l_i_j = tl.exp(m_i_prev - m_i_j) * l_i_prev + tl.sum(P_tmp, axis=1)
-        scale_o = tl.exp(m_i_prev - m_i_j)
-        O_i_j = scale_o[:, None] * O_i_prev + tl.dot(P_tmp, V_j)
-
-        # update prev
-        O_i_prev = O_i_j
-        m_i_prev = m_i_j
-        l_i_prev = l_i_j
-
-    # finalize using the running _prev variables
-    l_bcast = tl.reshape(l_i_prev, (Q_TILE_SIZE, 1))  # (BQ, 1)
-    O_final = O_i_prev / l_bcast  # (BQ, D)
-    L_final = m_i_prev + tl.log(l_i_prev)  # (BQ,)
-
-    # make block pointers for final store
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_idx * stride_ob,
-        shape=(N_QUERIES, D),
-        strides=(stride_oq, stride_od),
-        offsets=(q_tile_idx * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_idx * stride_lb,
-        shape=(N_QUERIES,),
-        strides=(stride_lq,),
-        offsets=(q_tile_idx * Q_TILE_SIZE,),
-        block_shape=(Q_TILE_SIZE,),
-        order=(0,),
-    )
-
-    # store results using block pointers
     tl.store(O_block_ptr, tl.cast(O_final, tl.float32))
     tl.store(L_block_ptr, tl.cast(L_final, tl.float32))
 
@@ -585,7 +471,7 @@ class FlashAttention2TritonGPT(torch.autograd.Function):
         grid = (grid_q, B)
 
         # launch kernel
-        flash_fwd_kernel_safe[grid](
+        flash_fwd_kernel_gpt[grid](
             Q,
             K,
             V,
@@ -608,12 +494,14 @@ class FlashAttention2TritonGPT(torch.autograd.Function):
             Nq,
             Nk,
             ctx.scale,
+            is_causal,
             ctx.D,
             ctx.Bq,
             ctx.Bk,
         )
 
         # save for backward (note: heavy - for reference/backtesting only)
+        ctx.is_causal = is_causal
         ctx.save_for_backward(Q, K, V, O, L)
         return O
 
