@@ -84,8 +84,37 @@ class FlashAttention2(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx, Q, K, V, O, dO, L) -> Any:
-        raise NotImplementedError
+    def backward(ctx, dO) -> Any:
+        """
+        dO: B x Nq x d (gradient of loss w.r.t. output O)
+        Returns: dQ, dK, dV, None (None for is_causal)
+        """
+        # Retrieve saved tensors from forward pass
+        L, K, Q, V, O = ctx.saved_tensors
+
+        B, Nq, d = Q.shape
+
+        # Recompute attention scores and probabilities
+        S = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(d)  # B x Nq x Nk
+        P_ij = torch.exp(S - L.unsqueeze(-1))  # B x Nq x Nk (softmax probabilities)
+
+        # Compute dV: P^T @ dO
+        dV = torch.matmul(P_ij.transpose(-1, -2), dO)  # B x Nk x d
+
+        # Compute dP: dO @ V^T
+        dP = torch.matmul(dO, V.transpose(-1, -2))  # B x Nq x Nk
+
+        # Compute D vector: row-wise dot product of dO and O
+        D = torch.sum(dO * O, dim=-1)  # B x Nq
+
+        # Compute dS: P * (dP - D)
+        dS_ij = P_ij * (dP - D.unsqueeze(-1))  # B x Nq x Nk
+
+        # Compute dQ and dK (don't forget the scale factor)
+        dQ = torch.matmul(dS_ij, K) / math.sqrt(d)  # B x Nq x d
+        dK = torch.matmul(dS_ij.transpose(-1, -2), Q) / math.sqrt(d)  # B x Nk x d
+
+        return dQ, dK, dV, None  # None for is_causal gradient
 
 
 @triton.jit
