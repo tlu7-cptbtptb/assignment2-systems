@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 
 def generate_sample_data(seed=42):
@@ -85,7 +86,10 @@ def non_parallel_train(data: torch.Tensor, num_layers: int, num_steps: int, devi
         )
 
 
-def data_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int) -> None:
+def data_parallelism_main(
+    rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int, flatten_grad: bool = False
+) -> None:
+    print(f"""Starting DDP,  flatten_grad = {flatten_grad}""")
     setup(rank, world_size)
 
     # Set the device for this rank
@@ -119,8 +123,16 @@ def data_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_la
         # Backward pass
         loss.backward()
         # Sync gradients across workers (only difference between standard training and DDP)
-        for param in params:
-            dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG, async_op=False)
+        if flatten_grad:
+            grads = [p.grad for p in params]  # nested, needed for the unflatten below!
+            flat_grads = _flatten_dense_tensors(grads)
+            dist.all_reduce(flat_grads, op=dist.ReduceOp.AVG, async_op=False)
+            _unflatten_dense_tensors(flat_grads, grads)
+
+        else:
+            for param in params:
+                dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG, async_op=False)
+
         # Print gradients for comparison (before optimizer step)
         if step == 0:
             print(
@@ -138,6 +150,13 @@ def data_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_la
 
 
 if __name__ == "__main__":
+    # take args from command line
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--flatten_grad", action="store_true", help="Use flattened gradient all_reduce")
+    args = parser.parse_args()
+
     world_size = 2
     num_layers = 2
     num_steps = 3
@@ -159,7 +178,7 @@ if __name__ == "__main__":
     print("=" * 80)
     mp.spawn(
         fn=data_parallelism_main,
-        args=(world_size, data, num_layers, num_steps),
+        args=(world_size, data, num_layers, num_steps, args.flatten_grad),
         nprocs=world_size,
         join=True,
     )
