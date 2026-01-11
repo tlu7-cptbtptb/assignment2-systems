@@ -127,7 +127,8 @@ def data_parallelism_main(
             grads = [p.grad for p in params]  # nested, needed for the unflatten below!
             flat_grads = _flatten_dense_tensors(grads)
             dist.all_reduce(flat_grads, op=dist.ReduceOp.AVG, async_op=False)
-            _unflatten_dense_tensors(flat_grads, grads)
+            for unflat_grad, param in zip(_unflatten_dense_tensors(flat_grads, grads), params):
+                param.grad.copy_(unflat_grad)
 
         else:
             for param in params:
