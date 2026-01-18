@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Type
 from cs336_systems.cs336_systems.flash_attention import FlashAttention2, FlashAttention2Triton, FlashAttention2TritonGPT
 from cs336_systems.cs336_systems.ddp import DDP, BucketDDP
+from cs336_systems.cs336_systems.sharded_optimizer import ShardedStateOptimizer
 import torch
 
 
@@ -134,4 +135,4 @@ def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return ShardedStateOptimizer(params, optimizer_cls, **kwargs)
